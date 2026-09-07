@@ -105,7 +105,14 @@ app.get('/api/test-db', async (req, res) => {
 app.get('/api/items', async (req, res) => {
   try {
     const itemsResult = await pool.query(
-      'SELECT * FROM items ORDER BY created_at DESC'
+      `SELECT *,
+        EXTRACT(DAY FROM NOW() - created_at)::int AS days_held,
+        CASE WHEN date_sold IS NOT NULL 
+             THEN EXTRACT(DAY FROM date_sold - created_at)::int 
+             ELSE NULL END AS days_to_sell,
+        (status NOT IN ('SOLD', 'ARCHIVED') AND created_at < NOW() - INTERVAL '90 days') AS needs_attention
+       FROM items 
+       ORDER BY created_at DESC`
     );
 
     const imagesResult = await pool.query(
