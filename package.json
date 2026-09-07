@@ -11,9 +11,11 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "heic-convert": "^2.1.0",
     "multer": "^2.3.0",
     "pg": "^8.23.0"
   }
