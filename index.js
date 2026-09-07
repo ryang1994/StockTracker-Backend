@@ -174,16 +174,17 @@ app.put('/api/items/:id', async (req, res) => {
       size,
       condition,
       purchase_cost,
+      listing_price,
       box_number
     } = req.body;
 
     const result = await pool.query(
       `UPDATE items 
        SET brand = $1, category = $2, size = $3, condition = $4, 
-           purchase_cost = $5, box_number = $6, updated_at = NOW()
-       WHERE id = $7 
+           purchase_cost = $5, listing_price = $6, box_number = $7, updated_at = NOW()
+       WHERE id = $8 
        RETURNING *`,
-      [brand, category, size, condition, purchase_cost || null, box_number || null, id]
+      [brand, category, size, condition, purchase_cost || null, listing_price || null, box_number || null, id]
     );
 
     if (result.rows.length === 0) {
@@ -205,22 +206,75 @@ app.post('/api/items', async (req, res) => {
       size,
       condition,
       purchase_cost,
+      listing_price,
       status,
       box_number
     } = req.body;
 
     const result = await pool.query(
       `INSERT INTO items 
-        (brand, category, size, condition, purchase_cost, status, box_number)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+        (brand, category, size, condition, purchase_cost, listing_price, status, box_number)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
-      [brand, category, size, condition, purchase_cost || null, status || 'DRAFT', box_number || null]
+      [brand, category, size, condition, purchase_cost || null, listing_price || null, status || 'DRAFT', box_number || null]
     );
 
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to create item', details: err.message });
+  }
+});
+// Dashboard summary stats
+app.get('/api/stats', async (req, res) => {
+  try {
+    const totalResult = await pool.query('SELECT COUNT(*) FROM items');
+    
+    const sellingResult = await pool.query(
+      `SELECT COUNT(*), COALESCE(SUM(listing_price), 0) as total_listing_value 
+       FROM items WHERE status IN ('ACTIVE', 'LISTED')`
+    );
+
+    const attentionResult = await pool.query(
+      `SELECT COUNT(*) FROM items 
+       WHERE status NOT IN ('SOLD', 'ARCHIVED') 
+       AND created_at < NOW() - INTERVAL '90 days'`
+    );
+
+    res.json({
+      totalItems: parseInt(totalResult.rows[0].count),
+      selling: parseInt(sellingResult.rows[0].count),
+      listedValue: parseFloat(sellingResult.rows[0].total_listing_value),
+      needAttention: parseInt(attentionResult.rows[0].count)
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch stats', details: err.message });
+  }
+});
+
+// Mark an item as SOLD with the actual sale price
+app.patch('/api/items/:id/sell', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { sold_price } = req.body;
+
+    const result = await pool.query(
+      `UPDATE items 
+       SET status = 'SOLD', sold_price = $1, date_sold = NOW(), updated_at = NOW()
+       WHERE id = $2 
+       RETURNING *`,
+      [sold_price || null, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to mark item as sold', details: err.message });
   }
 });
 
