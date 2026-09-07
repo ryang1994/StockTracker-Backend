@@ -110,7 +110,10 @@ app.get('/api/items', async (req, res) => {
         CASE WHEN date_sold IS NOT NULL 
              THEN EXTRACT(DAY FROM date_sold - created_at)::int 
              ELSE NULL END AS days_to_sell,
-        (status NOT IN ('SOLD', 'ARCHIVED') AND created_at < NOW() - INTERVAL '90 days') AS needs_attention
+        CASE WHEN date_dispatched IS NOT NULL 
+             THEN EXTRACT(DAY FROM NOW() - date_dispatched)::int 
+             ELSE NULL END AS days_since_dispatch,
+        (status NOT IN ('SOLD', 'DISPATCHED', 'ARCHIVED') AND created_at < NOW() - INTERVAL '90 days') AS needs_attention
        FROM items 
        ORDER BY created_at DESC`
     );
@@ -182,16 +185,17 @@ app.put('/api/items/:id', async (req, res) => {
       condition,
       purchase_cost,
       listing_price,
+      listing_url,
       box_number
     } = req.body;
 
     const result = await pool.query(
       `UPDATE items 
        SET brand = $1, category = $2, size = $3, condition = $4, 
-           purchase_cost = $5, listing_price = $6, box_number = $7, updated_at = NOW()
-       WHERE id = $8 
+           purchase_cost = $5, listing_price = $6, box_number = $7, listing_url = $8, updated_at = NOW()
+       WHERE id = $9 
        RETURNING *`,
-      [brand, category, size, condition, purchase_cost || null, listing_price || null, box_number || null, id]
+      [brand, category, size, condition, purchase_cost || null, listing_price || null, box_number || null, listing_url || null, id]
     );
 
     if (result.rows.length === 0) {
@@ -284,7 +288,29 @@ app.patch('/api/items/:id/sell', async (req, res) => {
     res.status(500).json({ error: 'Failed to mark item as sold', details: err.message });
   }
 });
+// Mark an item as DISPATCHED
+app.patch('/api/items/:id/dispatch', async (req, res) => {
+  try {
+    const { id } = req.params;
 
+    const result = await pool.query(
+      `UPDATE items 
+       SET status = 'DISPATCHED', date_dispatched = NOW(), updated_at = NOW()
+       WHERE id = $1 
+       RETURNING *`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to mark item as dispatched', details: err.message });
+  }
+});
 // UPDATE an item's status
 app.patch('/api/items/:id/status', async (req, res) => {
   try {
