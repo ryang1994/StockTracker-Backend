@@ -182,6 +182,27 @@ app.get('/api/items', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch items', details: err.message });
   }
 });
+// Open the item's photo folder in Windows Explorer (local dev convenience only)
+app.post('/api/items/:id/open-folder', (req, res) => {
+  try {
+    const { id } = req.params;
+    const folderPath = path.join(__dirname, 'uploads', String(id));
+
+    if (!fs.existsSync(folderPath)) {
+      return res.status(404).json({ error: 'Folder does not exist yet' });
+    }
+
+    const { exec } = require('child_process');
+    exec(`explorer "${folderPath}"`, (err) => {
+      // explorer.exe often returns a non-zero exit code even on success, so we don't treat this as fatal
+    });
+
+    res.json({ message: 'Folder opened' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to open folder', details: err.message });
+  }
+});
 
 // CREATE a new item
 app.post('/api/items', async (req, res) => {
