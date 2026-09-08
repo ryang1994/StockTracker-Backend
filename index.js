@@ -99,7 +99,43 @@ app.get('/api/test-db', async (req, res) => {
     res.status(500).json({ error: 'Database connection failed', details: err.message });
   }
 });
+// Archived items (permanent historical record) with profit summary
+app.get('/api/archive', async (req, res) => {
+  try {
+    const archivedResult = await pool.query(
+      `SELECT id, brand, category, size, colour, condition, purchase_cost, 
+              sold_price, listing_price, date_sold, date_dispatched, date_archived, 
+              thumbnail_key, box_number
+       FROM items 
+       WHERE status = 'ARCHIVED'
+       ORDER BY date_archived DESC`
+    );
 
+    const items = archivedResult.rows.map(item => {
+      const profit = (item.sold_price != null && item.purchase_cost != null)
+        ? parseFloat(item.sold_price) - parseFloat(item.purchase_cost)
+        : null;
+      return { ...item, profit };
+    });
+
+    const totalRevenue = items.reduce((sum, i) => sum + (i.sold_price ? parseFloat(i.sold_price) : 0), 0);
+    const totalCost = items.reduce((sum, i) => sum + (i.purchase_cost ? parseFloat(i.purchase_cost) : 0), 0);
+    const totalProfit = totalRevenue - totalCost;
+
+    res.json({
+      items,
+      summary: {
+        totalItems: items.length,
+        totalRevenue,
+        totalCost,
+        totalProfit
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch archive', details: err.message });
+  }
+});
 // Dashboard summary stats
 app.get('/api/stats', async (req, res) => {
   try {
@@ -131,6 +167,43 @@ app.get('/api/stats', async (req, res) => {
 // GET all items (including their images)
 app.get('/api/items', async (req, res) => {
   try {
+    // Auto-archive items that have been dispatched 14+ days ago
+    const toArchiveResult = await pool.query(
+      `SELECT id FROM items 
+       WHERE status = 'DISPATCHED' 
+       AND date_dispatched < NOW() - INTERVAL '14 days'`
+    );
+
+    for (const row of toArchiveResult.rows) {
+      const itemImages = await pool.query(
+        'SELECT * FROM images WHERE item_id = $1 AND is_deleted = FALSE',
+        [row.id]
+      );
+
+      if (itemImages.rows.length > 0) {
+        const keepImage = itemImages.rows[0];
+
+        // Delete all other images for this item from disk and mark them deleted
+        for (const img of itemImages.rows.slice(1)) {
+          const filePath = path.join(__dirname, img.object_key);
+          fs.unlink(filePath, (err) => {
+            if (err) console.error('Failed to delete archived image file:', filePath, err.message);
+          });
+          await pool.query('UPDATE images SET is_deleted = TRUE WHERE id = $1', [img.id]);
+        }
+
+        await pool.query(
+          `UPDATE items SET status = 'ARCHIVED', date_archived = NOW(), thumbnail_key = $1 WHERE id = $2`,
+          [keepImage.object_key, row.id]
+        );
+      } else {
+        await pool.query(
+          `UPDATE items SET status = 'ARCHIVED', date_archived = NOW() WHERE id = $1`,
+          [row.id]
+        );
+      }
+    }
+
     const itemsResult = await pool.query(
       `SELECT *,
         EXTRACT(DAY FROM NOW() - created_at)::int AS days_held,
