@@ -6,6 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const Anthropic = require('@anthropic-ai/sdk');
 const heicConvert = require('heic-convert');
+const sharp = require('sharp');
 require('dotenv').config();
 
 const app = express();
@@ -192,9 +193,38 @@ app.get('/api/items', async (req, res) => {
           await pool.query('UPDATE images SET is_deleted = TRUE WHERE id = $1', [img.id]);
         }
 
+        // Generate a genuine small thumbnail from the one photo we're keeping,
+        // then delete the full-resolution original so archived stock doesn't
+        // keep taking up full-size disk space forever.
+        const keepImagePath = path.join(__dirname, keepImage.object_key);
+        let thumbnailKey = keepImage.object_key;
+
+        try {
+          const thumbFilename = `thumb-${path.basename(keepImage.object_key, path.extname(keepImage.object_key))}.jpg`;
+          const thumbRelativePath = path.join('uploads', String(row.id), thumbFilename).replace(/\\/g, '/');
+          const thumbFullPath = path.join(__dirname, thumbRelativePath);
+
+          await sharp(keepImagePath)
+            .resize(400, 400, { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 80 })
+            .toFile(thumbFullPath);
+
+          fs.unlink(keepImagePath, (err) => {
+            if (err) console.error('Failed to delete full-res image after thumbnailing:', keepImagePath, err.message);
+          });
+
+          await pool.query('UPDATE images SET is_deleted = TRUE WHERE id = $1', [keepImage.id]);
+
+          thumbnailKey = thumbRelativePath;
+        } catch (thumbErr) {
+          // If thumbnailing fails for any reason, fall back to the old behaviour
+          // (keep the full-size file) rather than losing the image entirely.
+          console.error('Failed to generate thumbnail, keeping full-size image instead:', thumbErr.message);
+        }
+
         await pool.query(
           `UPDATE items SET status = 'ARCHIVED', date_archived = NOW(), thumbnail_key = $1 WHERE id = $2`,
-          [keepImage.object_key, row.id]
+          [thumbnailKey, row.id]
         );
       } else {
         await pool.query(
