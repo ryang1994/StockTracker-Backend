@@ -4,19 +4,18 @@ const { Pool } = require('pg');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-require('dotenv').config();
+const Anthropic = require('@anthropic-ai/sdk');
 const heicConvert = require('heic-convert');
+require('dotenv').config();
+
 const app = express();
 const port = process.env.PORT || 5000;
-const Anthropic = require('@anthropic-ai/sdk');
-// Middleware
+
 app.use(cors());
 app.use(express.json());
 
-// Serve uploaded images statically so the frontend can display them
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// PostgreSQL connection pool
 const pool = new Pool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
@@ -24,9 +23,11 @@ const pool = new Pool({
   port: process.env.DB_PORT,
   database: process.env.DB_NAME,
 });
+
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
+
 // Configure multer to save files into uploads/{item_id}/ (for permanent item photos)
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -43,7 +44,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max per file
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const isImageMime = file.mimetype.startsWith('image/');
     const isHeic = /\.heic$/i.test(file.originalname) || /\.heif$/i.test(file.originalname);
@@ -82,12 +83,10 @@ const uploadTemp = multer({
   }
 });
 
-// Test route - checks server is running
 app.get('/', (req, res) => {
   res.json({ message: 'Stock Tracker backend is running!' });
 });
 
-// Test route - checks database connection
 app.get('/api/test-db', async (req, res) => {
   try {
     const result = await pool.query('SELECT NOW()');
@@ -98,6 +97,34 @@ app.get('/api/test-db', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Database connection failed', details: err.message });
+  }
+});
+
+// Dashboard summary stats
+app.get('/api/stats', async (req, res) => {
+  try {
+    const totalResult = await pool.query('SELECT COUNT(*) FROM items');
+
+    const sellingResult = await pool.query(
+      `SELECT COUNT(*), COALESCE(SUM(listing_price), 0) as total_listing_value 
+       FROM items WHERE status IN ('ACTIVE', 'LISTED')`
+    );
+
+    const attentionResult = await pool.query(
+      `SELECT COUNT(*) FROM items 
+       WHERE status NOT IN ('SOLD', 'DISPATCHED', 'ARCHIVED') 
+       AND created_at < NOW() - INTERVAL '90 days'`
+    );
+
+    res.json({
+      totalItems: parseInt(totalResult.rows[0].count),
+      selling: parseInt(sellingResult.rows[0].count),
+      listedValue: parseFloat(sellingResult.rows[0].total_listing_value),
+      needAttention: parseInt(attentionResult.rows[0].count)
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch stats', details: err.message });
   }
 });
 
@@ -122,9 +149,31 @@ app.get('/api/items', async (req, res) => {
       'SELECT * FROM images WHERE is_deleted = FALSE ORDER BY created_at ASC'
     );
 
+    const generateDescription = (item) => {
+      const parts = [];
+      if (item.department) parts.push(item.department + "'s");
+      if (item.brand) parts.push(item.brand);
+      if (item.colour) parts.push(item.colour);
+      if (item.style) parts.push(item.style);
+      if (item.category) parts.push(item.category);
+      let title = parts.join(' ') || 'Item';
+
+      let detailBits = [];
+      if (item.size) detailBits.push(`Size ${item.size}`);
+      if (item.outer_shell_material || item.material) detailBits.push(item.outer_shell_material || item.material);
+      let detailLine = detailBits.length > 0 ? detailBits.join(', ') + '. ' : '';
+
+      let conditionLine = item.condition ? `${item.condition} pre-owned condition. ` : '';
+
+      let defectsLine = item.visible_defects ? `Note: ${item.visible_defects}. ` : '';
+
+      return `${title}. ${detailLine}${conditionLine}${defectsLine}Please see photos for full details.`.trim();
+    };
+
     const itemsWithImages = itemsResult.rows.map(item => ({
       ...item,
-      images: imagesResult.rows.filter(img => img.item_id === item.id)
+      images: imagesResult.rows.filter(img => img.item_id === item.id),
+      generated_description: generateDescription(item)
     }));
 
     res.json(itemsWithImages);
@@ -133,69 +182,53 @@ app.get('/api/items', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch items', details: err.message });
   }
 });
-// DELETE an item (and its images)
-app.delete('/api/items/:id', async (req, res) => {
+
+// CREATE a new item
+app.post('/api/items', async (req, res) => {
   try {
-    const { id } = req.params;
-
-    // Get the item's images first so we can delete the files from disk
-    const imagesResult = await pool.query(
-      'SELECT * FROM images WHERE item_id = $1',
-      [id]
-    );
-
-    // Delete the item (images row will cascade-delete automatically due to ON DELETE CASCADE)
-    const result = await pool.query(
-      'DELETE FROM items WHERE id = $1 RETURNING *',
-      [id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Item not found' });
-    }
-
-    // Delete the actual image files from disk
-    imagesResult.rows.forEach(img => {
-      const filePath = path.join(__dirname, img.object_key);
-      fs.unlink(filePath, (err) => {
-        if (err) console.error('Failed to delete file:', filePath, err.message);
-      });
-    });
-
-    // Also try to remove the now-empty item folder
-    const itemFolder = path.join(__dirname, 'uploads', String(id));
-    fs.rm(itemFolder, { recursive: true, force: true }, (err) => {
-      if (err) console.error('Failed to remove folder:', itemFolder, err.message);
-    });
-
-    res.json({ message: 'Item deleted successfully' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to delete item', details: err.message });
-  }
-});
-// UPDATE an item's full details
-app.put('/api/items/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
     const {
       brand,
       category,
       size,
+      colour,
       condition,
+      material,
+      style,
+      department,
+      outer_shell_material,
       purchase_cost,
       listing_price,
-      listing_url,
+      status,
       box_number
     } = req.body;
 
     const result = await pool.query(
-      `UPDATE items 
-       SET brand = $1, category = $2, size = $3, condition = $4, 
-           purchase_cost = $5, listing_price = $6, box_number = $7, listing_url = $8, updated_at = NOW()
-       WHERE id = $9 
+      `INSERT INTO items 
+        (brand, category, size, colour, condition, material, style, department, outer_shell_material, purchase_cost, listing_price, status, box_number)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING *`,
-      [brand, category, size, condition, purchase_cost || null, listing_price || null, box_number || null, listing_url || null, id]
+      [brand, category, size, colour || null, condition, material || null, style || null, department || null, outer_shell_material || null, purchase_cost || null, listing_price || null, status || 'DRAFT', box_number || null]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create item', details: err.message });
+  }
+});
+
+// UPDATE an item's status
+app.patch('/api/items/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    const result = await pool.query(
+      `UPDATE items 
+       SET status = $1, updated_at = NOW() 
+       WHERE id = $2 
+       RETURNING *`,
+      [status, id]
     );
 
     if (result.rows.length === 0) {
@@ -206,61 +239,6 @@ app.put('/api/items/:id', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to update item', details: err.message });
-  }
-});
-// CREATE a new item
-app.post('/api/items', async (req, res) => {
-  try {
-    const {
-      brand,
-      category,
-      size,
-      condition,
-      purchase_cost,
-      listing_price,
-      status,
-      box_number
-    } = req.body;
-
-    const result = await pool.query(
-      `INSERT INTO items 
-        (brand, category, size, condition, purchase_cost, listing_price, status, box_number)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING *`,
-      [brand, category, size, condition, purchase_cost || null, listing_price || null, status || 'DRAFT', box_number || null]
-    );
-
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to create item', details: err.message });
-  }
-});
-// Dashboard summary stats
-app.get('/api/stats', async (req, res) => {
-  try {
-    const totalResult = await pool.query('SELECT COUNT(*) FROM items');
-    
-    const sellingResult = await pool.query(
-      `SELECT COUNT(*), COALESCE(SUM(listing_price), 0) as total_listing_value 
-       FROM items WHERE status IN ('ACTIVE', 'LISTED')`
-    );
-
-    const attentionResult = await pool.query(
-      `SELECT COUNT(*) FROM items 
-       WHERE status NOT IN ('SOLD', 'ARCHIVED') 
-       AND created_at < NOW() - INTERVAL '90 days'`
-    );
-
-    res.json({
-      totalItems: parseInt(totalResult.rows[0].count),
-      selling: parseInt(sellingResult.rows[0].count),
-      listedValue: parseFloat(sellingResult.rows[0].total_listing_value),
-      needAttention: parseInt(attentionResult.rows[0].count)
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to fetch stats', details: err.message });
   }
 });
 
@@ -288,6 +266,7 @@ app.patch('/api/items/:id/sell', async (req, res) => {
     res.status(500).json({ error: 'Failed to mark item as sold', details: err.message });
   }
 });
+
 // Mark an item as DISPATCHED
 app.patch('/api/items/:id/dispatch', async (req, res) => {
   try {
@@ -311,18 +290,35 @@ app.patch('/api/items/:id/dispatch', async (req, res) => {
     res.status(500).json({ error: 'Failed to mark item as dispatched', details: err.message });
   }
 });
-// UPDATE an item's status
-app.patch('/api/items/:id/status', async (req, res) => {
+
+// UPDATE an item's full details
+app.put('/api/items/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const {
+      brand,
+      category,
+      size,
+      colour,
+      condition,
+      material,
+      style,
+      department,
+      outer_shell_material,
+      purchase_cost,
+      listing_price,
+      listing_url,
+      box_number
+    } = req.body;
 
     const result = await pool.query(
       `UPDATE items 
-       SET status = $1, updated_at = NOW() 
-       WHERE id = $2 
+       SET brand = $1, category = $2, size = $3, colour = $4, condition = $5, material = $6,
+           style = $7, department = $8, outer_shell_material = $9,
+           purchase_cost = $10, listing_price = $11, box_number = $12, listing_url = $13, updated_at = NOW()
+       WHERE id = $14 
        RETURNING *`,
-      [status, id]
+      [brand, category, size, colour || null, condition, material || null, style || null, department || null, outer_shell_material || null, purchase_cost || null, listing_price || null, box_number || null, listing_url || null, id]
     );
 
     if (result.rows.length === 0) {
@@ -333,6 +329,44 @@ app.patch('/api/items/:id/status', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to update item', details: err.message });
+  }
+});
+
+// DELETE an item (and its images)
+app.delete('/api/items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const imagesResult = await pool.query(
+      'SELECT * FROM images WHERE item_id = $1',
+      [id]
+    );
+
+    const result = await pool.query(
+      'DELETE FROM items WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    imagesResult.rows.forEach(img => {
+      const filePath = path.join(__dirname, img.object_key);
+      fs.unlink(filePath, (err) => {
+        if (err) console.error('Failed to delete file:', filePath, err.message);
+      });
+    });
+
+    const itemFolder = path.join(__dirname, 'uploads', String(id));
+    fs.rm(itemFolder, { recursive: true, force: true }, (err) => {
+      if (err) console.error('Failed to remove folder:', itemFolder, err.message);
+    });
+
+    res.json({ message: 'Item deleted successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete item', details: err.message });
   }
 });
 
@@ -359,7 +393,6 @@ app.post('/api/items/:itemId/images', upload.array('photos', 6), async (req, res
           quality: 0.9
         });
 
-        // Save as a new .jpg file alongside, then remove the original .heic
         const jpgFilename = file.filename.replace(/\.[^.]+$/, '') + '.jpg';
         const jpgPath = path.join(path.dirname(file.path), jpgFilename);
         fs.writeFileSync(jpgPath, outputBuffer);
@@ -384,13 +417,14 @@ app.post('/api/items/:itemId/images', upload.array('photos', 6), async (req, res
     res.status(500).json({ error: 'Failed to upload images', details: err.message });
   }
 });
+
 // ANALYZE photos with AI - returns suggested item attributes (does not save)
-app.post('/api/analyze-photos', uploadTemp.array('photos', 6), async (req, res) => {  try {
+app.post('/api/analyze-photos', uploadTemp.array('photos', 6), async (req, res) => {
+  try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: 'No photos uploaded' });
     }
 
-    // Convert uploaded images to base64 for Claude (converting HEIC to JPEG first if needed)
     const imageBlocks = await Promise.all(req.files.map(async (file) => {
       const isHeic = /\.heic$/i.test(file.originalname) || /\.heif$/i.test(file.originalname) || file.mimetype === 'image/heic' || file.mimetype === 'image/heif';
 
@@ -418,6 +452,8 @@ app.post('/api/analyze-photos', uploadTemp.array('photos', 6), async (req, res) 
       };
     }));
 
+    const promptText = "You are analyzing photos of a second-hand clothing item for a reselling inventory system. Look at all the provided photos (which may include front, back, brand label, size label, care label, etc.) and extract the following information. Respond ONLY with valid JSON, no other text, no markdown formatting, in exactly this structure: { \"brand\": \"string or null\", \"category\": \"string or null (e.g. Hoodie, T-Shirt, Jeans, Jacket)\", \"department\": \"string or null (Men, Women, Kids, Unisex)\", \"size\": \"string or null\", \"colour\": \"string or null\", \"material\": \"string or null\", \"outer_shell_material\": \"string or null (the main fabric composition, e.g. 100% Cotton, Polyester blend - check care labels if visible)\", \"style\": \"string or null (e.g. Pullover, Zip-up, Slim Fit, Regular Fit)\", \"condition\": \"string or null (Like New, Very Good, Good, Fair)\", \"visible_defects\": \"string or null (describe any visible defects, or null if none seen)\", \"confidence_notes\": \"string (brief note on which fields you are unsure about)\" }. If you cannot determine a field from the photos, use null for that field. Do not guess brand names if no logo or label is visible - use null instead.";
+
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-5',
       max_tokens: 1024,
@@ -428,23 +464,7 @@ app.post('/api/analyze-photos', uploadTemp.array('photos', 6), async (req, res) 
             ...imageBlocks,
             {
               type: 'text',
-              text: `You are analyzing photos of a second-hand clothing item for a reselling inventory system. 
-Look at all the provided photos (which may include front, back, brand label, size label, etc.) and extract the following information.
-
-Respond ONLY with valid JSON, no other text, no markdown formatting, in exactly this structure:
-{
-  "brand": "string or null",
-  "category": "string or null (e.g. Hoodie, T-Shirt, Jeans, Jacket)",
-  "department": "string or null (Men, Women, Kids, Unisex)",
-  "size": "string or null",
-  "colour": "string or null",
-  "material": "string or null",
-  "condition": "string or null (Like New, Very Good, Good, Fair)",
-  "visible_defects": "string or null (describe any visible defects, or null if none seen)",
-  "confidence_notes": "string (brief note on which fields you are unsure about)"
-}
-
-If you cannot determine a field from the photos, use null for that field. Do not guess brand names if no logo or label is visible - use null instead.`
+              text: promptText
             }
           ]
         }
@@ -452,15 +472,13 @@ If you cannot determine a field from the photos, use null for that field. Do not
     });
 
     const responseText = message.content[0].text;
-    
-    // Clean up the temporary uploaded files since we don't need to keep them from this analysis step
+
     req.files.forEach(file => {
       fs.unlink(file.path, (err) => {
         if (err) console.error('Failed to clean up temp file:', err.message);
       });
     });
 
-    // Strip markdown code fences if Claude wrapped the JSON in them
     let cleanedText = responseText.trim();
     if (cleanedText.startsWith('```')) {
       cleanedText = cleanedText.replace(/^```(?:json)?\s*/, '').replace(/```\s*$/, '');
@@ -481,6 +499,7 @@ If you cannot determine a field from the photos, use null for that field. Do not
     res.status(500).json({ error: 'Failed to analyze photos', details: err.message });
   }
 });
+
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
 });
