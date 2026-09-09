@@ -168,11 +168,17 @@ app.get('/api/stats', async (req, res) => {
 // GET all items (including their images)
 app.get('/api/items', async (req, res) => {
   try {
-    // Auto-archive items that have been dispatched 14+ days ago
+    const archiveDaysResult = await pool.query("SELECT value FROM app_settings WHERE key = 'archive_after_days'");
+    const archiveAfterDays = archiveDaysResult.rows.length > 0 ? parseInt(archiveDaysResult.rows[0].value, 10) : 30;
+
+    // Auto-archive items that have been dispatched long enough ago (configurable in Settings).
+    // Items with a return flagged are skipped so their photos aren't destroyed mid-dispute.
     const toArchiveResult = await pool.query(
       `SELECT id FROM items 
        WHERE status = 'DISPATCHED' 
-       AND date_dispatched < NOW() - INTERVAL '14 days'`
+       AND date_dispatched < NOW() - ($1 * INTERVAL '1 day')
+       AND return_requested IS NOT TRUE`,
+      [archiveAfterDays]
     );
 
     for (const row of toArchiveResult.rows) {
@@ -252,11 +258,43 @@ app.get('/api/items', async (req, res) => {
       'SELECT * FROM images WHERE is_deleted = FALSE ORDER BY created_at ASC'
     );
 
-    const itemsWithImages = itemsResult.rows.map(item => ({
-      ...item,
-      images: imagesResult.rows.filter(img => img.item_id === item.id),
-      generated_description: generateDescription(item)
-    }));
+    const settingsResult = await pool.query('SELECT * FROM app_settings');
+    const appSettings = {};
+    settingsResult.rows.forEach(row => { appSettings[row.key] = row.value; });
+    const ebayDispatchDays = parseInt(appSettings.ebay_dispatch_days, 10) || 2;
+    const vintedDispatchDays = parseInt(appSettings.vinted_dispatch_days, 10) || 3;
+    const archiveAfterDaysForDisplay = parseInt(appSettings.archive_after_days, 10) || 30;
+
+    const itemsWithImages = itemsResult.rows.map(item => {
+      let dispatchDeadline = null;
+      let daysToDispatch = null;
+
+      if (item.status === 'SOLD' && item.date_sold) {
+        const dispatchDays = item.sold_platform === 'eBay' ? ebayDispatchDays
+          : item.sold_platform === 'Vinted' ? vintedDispatchDays
+          : null;
+
+        if (dispatchDays !== null) {
+          const soldDate = new Date(item.date_sold);
+          const deadline = new Date(soldDate.getTime() + dispatchDays * 24 * 60 * 60 * 1000);
+          dispatchDeadline = deadline;
+          daysToDispatch = Math.ceil((deadline.getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+        }
+      }
+
+      const daysUntilArchived = item.status === 'DISPATCHED' && item.days_since_dispatch != null
+        ? Math.max(0, archiveAfterDaysForDisplay - item.days_since_dispatch)
+        : null;
+
+      return {
+        ...item,
+        images: imagesResult.rows.filter(img => img.item_id === item.id),
+        generated_description: generateDescription(item),
+        dispatch_deadline: dispatchDeadline,
+        days_to_dispatch: daysToDispatch,
+        days_until_archived: daysUntilArchived
+      };
+    });
 
     res.json(itemsWithImages);
   } catch (err) {
@@ -303,6 +341,7 @@ app.post('/api/items', async (req, res) => {
       listing_price,
       status,
       box_number,
+      box_id,
       quantity
     } = req.body;
 
@@ -315,10 +354,10 @@ app.post('/api/items', async (req, res) => {
 
       const result = await pool.query(
         `INSERT INTO items 
-          (item_number, brand, category, size, colour, condition, material, style, department, outer_shell_material, purchase_cost, listing_price, status, box_number)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+          (item_number, brand, category, size, colour, condition, material, style, department, outer_shell_material, purchase_cost, listing_price, status, box_number, box_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
          RETURNING *`,
-        [itemNumber, brand, category, size, colour || null, condition, material || null, style || null, department || null, outer_shell_material || null, purchase_cost || null, listing_price || null, status || 'DRAFT', box_number || null]
+        [itemNumber, brand, category, size, colour || null, condition, material || null, style || null, department || null, outer_shell_material || null, purchase_cost || null, listing_price || null, status || 'DRAFT', box_number || null, box_id || null]
       );
 
       createdItems.push({ ...result.rows[0], generated_description: generateDescription(result.rows[0]) });
@@ -360,14 +399,14 @@ app.patch('/api/items/:id/status', async (req, res) => {
 app.patch('/api/items/:id/sell', async (req, res) => {
   try {
     const { id } = req.params;
-    const { sold_price, selling_fees } = req.body;
+    const { sold_price, selling_fees, sold_platform } = req.body;
 
     const result = await pool.query(
       `UPDATE items 
-       SET status = 'SOLD', sold_price = $1, selling_fees = $2, date_sold = NOW(), updated_at = NOW()
-       WHERE id = $3 
+       SET status = 'SOLD', sold_price = $1, selling_fees = $2, sold_platform = $3, date_sold = NOW(), updated_at = NOW()
+       WHERE id = $4 
        RETURNING *`,
-      [sold_price || null, selling_fees || 0, id]
+      [sold_price || null, selling_fees || 0, sold_platform || null, id]
     );
 
     if (result.rows.length === 0) {
@@ -405,6 +444,82 @@ app.patch('/api/items/:id/dispatch', async (req, res) => {
   }
 });
 
+// Flag: buyer has requested a return - doesn't touch the sale, just marks it for visibility
+app.patch('/api/items/:id/flag-return', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `UPDATE items SET return_requested = TRUE, return_requested_at = NOW(), updated_at = NOW()
+       WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    res.json({ ...result.rows[0], generated_description: generateDescription(result.rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to flag return', details: err.message });
+  }
+});
+
+// Cancel a flagged return - the complaint resolved without an actual physical return
+app.patch('/api/items/:id/unflag-return', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `UPDATE items SET return_requested = FALSE, return_requested_at = NULL, updated_at = NOW()
+       WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    res.json({ ...result.rows[0], generated_description: generateDescription(result.rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to cancel return flag', details: err.message });
+  }
+});
+
+// Return: item came back from a buyer, undo the sale and put it back to DRAFT to relist
+app.patch('/api/items/:id/return', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Capture the sale details before wiping them, so return history isn't lost
+    const beforeResult = await pool.query('SELECT * FROM items WHERE id = $1', [id]);
+    if (beforeResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+    const before = beforeResult.rows[0];
+
+    await pool.query(
+      `INSERT INTO returns_log 
+        (item_id, item_number, brand, category, sold_price, selling_fees, sold_platform, date_sold, date_dispatched)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [before.id, before.item_number, before.brand, before.category, before.sold_price, before.selling_fees, before.sold_platform, before.date_sold, before.date_dispatched]
+    );
+
+    const result = await pool.query(
+      `UPDATE items 
+       SET status = 'DRAFT', 
+           sold_price = NULL, 
+           selling_fees = 0, 
+           sold_platform = NULL, 
+           date_sold = NULL, 
+           date_dispatched = NULL, 
+           return_requested = FALSE,
+           return_requested_at = NULL,
+           updated_at = NOW()
+       WHERE id = $1 
+       RETURNING *`,
+      [id]
+    );
+
+    res.json({ ...result.rows[0], generated_description: generateDescription(result.rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to process return', details: err.message });
+  }
+});
+
 // UPDATE an item's full details
 app.put('/api/items/:id', async (req, res) => {
   try {
@@ -422,17 +537,21 @@ app.put('/api/items/:id', async (req, res) => {
       purchase_cost,
       listing_price,
       listing_url,
-      box_number
+      box_number,
+      box_id,
+      ebay_url,
+      vinted_url
     } = req.body;
 
     const result = await pool.query(
       `UPDATE items 
        SET brand = $1, category = $2, size = $3, colour = $4, condition = $5, material = $6,
            style = $7, department = $8, outer_shell_material = $9,
-           purchase_cost = $10, listing_price = $11, box_number = $12, listing_url = $13, updated_at = NOW()
-       WHERE id = $14 
+           purchase_cost = $10, listing_price = $11, box_number = $12, listing_url = $13,
+           box_id = $14, ebay_url = $15, vinted_url = $16, updated_at = NOW()
+       WHERE id = $17 
        RETURNING *`,
-      [brand, category, size, colour || null, condition, material || null, style || null, department || null, outer_shell_material || null, purchase_cost || null, listing_price || null, box_number || null, listing_url || null, id]
+      [brand, category, size, colour || null, condition, material || null, style || null, department || null, outer_shell_material || null, purchase_cost || null, listing_price || null, box_number || null, listing_url || null, box_id || null, ebay_url || null, vinted_url || null, id]
     );
 
     if (result.rows.length === 0) {
@@ -1025,6 +1144,14 @@ app.get('/api/bookkeeping/summary', async (req, res) => {
 
     const deadlines = getSelfAssessmentDeadlines(startYear);
 
+    const returnsResult = await pool.query(
+      `SELECT COUNT(*) AS count, COALESCE(SUM(sold_price), 0) AS total
+       FROM returns_log WHERE returned_at >= $1 AND returned_at <= $2`,
+      [start, end]
+    );
+    const returnsCount = parseInt(returnsResult.rows[0].count, 10);
+    const returnsValue = parseFloat(returnsResult.rows[0].total);
+
     res.json({
       taxYear: { startYear, label: `${startYear}/${String(startYear + 1).slice(2)}` },
       turnover,
@@ -1040,6 +1167,8 @@ app.get('/api/bookkeeping/summary', async (req, res) => {
       tradingAllowance: TRADING_ALLOWANCE,
       tax: taxBreakdown,
       receiptsRecorded: stockReceipts + mileageReceipts + expenseReceipts,
+      returnsCount,
+      returnsValue,
       deadlines: {
         registration: deadlines.registrationDeadline,
         filingAndPayment: deadlines.filingPaymentDeadline
@@ -1124,6 +1253,26 @@ app.get('/api/bookkeeping/export', async (req, res) => {
       ].join(',') + '\n';
     }
 
+    csv += '\nRETURNS (sales that were refunded and removed from turnover above)\n';
+    csv += 'Item Number,Brand,Category,Original Sale Price,Marketplace Fees,Sold Via,Date Sold,Date Dispatched,Date Returned\n';
+    const returnsResult = await pool.query(
+      `SELECT * FROM returns_log WHERE returned_at >= $1 AND returned_at <= $2 ORDER BY returned_at ASC`,
+      [start, end]
+    );
+    for (const row of returnsResult.rows) {
+      csv += [
+        csvEscape(row.item_number),
+        csvEscape(row.brand),
+        csvEscape(row.category),
+        parseFloat(row.sold_price || 0).toFixed(2),
+        parseFloat(row.selling_fees || 0).toFixed(2),
+        csvEscape(row.sold_platform),
+        row.date_sold ? new Date(row.date_sold).toLocaleDateString('en-GB') : '',
+        row.date_dispatched ? new Date(row.date_dispatched).toLocaleDateString('en-GB') : '',
+        new Date(row.returned_at).toLocaleDateString('en-GB')
+      ].join(',') + '\n';
+    }
+
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="stocktracker-tax-year-${label}.csv"`);
     res.send(csv);
@@ -1153,6 +1302,106 @@ app.post('/api/items/:id/purchase-receipt', uploadReceipt.single('receipt'), asy
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to upload purchase receipt' });
+  }
+});
+
+// ===================== BOXES =====================
+
+app.get('/api/boxes', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM boxes ORDER BY name ASC');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch boxes' });
+  }
+});
+
+app.post('/api/boxes', async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Box name is required' });
+    const result = await pool.query('INSERT INTO boxes (name) VALUES ($1) RETURNING *', [name.trim()]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create box' });
+  }
+});
+
+app.put('/api/boxes/:id', async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Box name is required' });
+    const result = await pool.query('UPDATE boxes SET name = $1 WHERE id = $2 RETURNING *', [name.trim(), req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Box not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to rename box' });
+  }
+});
+
+app.delete('/api/boxes/:id', async (req, res) => {
+  try {
+    const inUse = await pool.query('SELECT COUNT(*) FROM items WHERE box_id = $1', [req.params.id]);
+    if (parseInt(inUse.rows[0].count, 10) > 0) {
+      return res.status(400).json({ error: 'Cannot delete a box that still has items assigned to it' });
+    }
+    await pool.query('DELETE FROM boxes WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete box' });
+  }
+});
+
+// ===================== APP SETTINGS (backup status, dispatch presets, eBay/Vinted placeholders) =====================
+
+app.get('/api/settings/app', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM app_settings');
+    const settings = {};
+    result.rows.forEach(row => { settings[row.key] = row.value; });
+    res.json(settings);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch app settings' });
+  }
+});
+
+app.put('/api/settings/app', async (req, res) => {
+  try {
+    const updates = req.body;
+    for (const [key, value] of Object.entries(updates)) {
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = $2`,
+        [key, String(value)]
+      );
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update app settings' });
+  }
+});
+
+// Live check: is the Claude API key actually valid right now? Uses the free count_tokens
+// endpoint, which costs nothing and doesn't generate a completion - just tests auth.
+app.get('/api/settings/ai-status', async (req, res) => {
+  try {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.json({ active: false, reason: 'No API key configured' });
+    }
+    await anthropic.messages.countTokens({
+      model: 'claude-sonnet-5',
+      messages: [{ role: 'user', content: 'ping' }]
+    });
+    res.json({ active: true });
+  } catch (err) {
+    console.error('AI status check failed:', err.message);
+    res.json({ active: false, reason: err.message });
   }
 });
 
