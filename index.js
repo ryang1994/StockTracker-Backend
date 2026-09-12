@@ -1405,6 +1405,178 @@ app.get('/api/settings/ai-status', async (req, res) => {
   }
 });
 
+// ===================== EBAY OAUTH INTEGRATION =====================
+
+const EBAY_ENV = process.env.EBAY_ENVIRONMENT || 'sandbox'; // 'sandbox' or 'production'
+const EBAY_AUTH_BASE = EBAY_ENV === 'production' ? 'https://auth.ebay.com' : 'https://auth.sandbox.ebay.com';
+const EBAY_API_BASE = EBAY_ENV === 'production' ? 'https://api.ebay.com' : 'https://api.sandbox.ebay.com';
+
+const EBAY_SCOPES = [
+  'https://api.ebay.com/oauth/api_scope',
+  'https://api.ebay.com/oauth/api_scope/sell.inventory',
+  'https://api.ebay.com/oauth/api_scope/sell.account'
+].join(' ');
+
+function getEbayBasicAuthHeader() {
+  const credentials = `${process.env.EBAY_APP_ID}:${process.env.EBAY_CERT_ID}`;
+  return 'Basic ' + Buffer.from(credentials).toString('base64');
+}
+
+// Step 1: send the user to eBay's consent page
+app.get('/api/ebay/connect', (req, res) => {
+  if (!process.env.EBAY_APP_ID || !process.env.EBAY_RUNAME) {
+    return res.status(500).send('eBay credentials are not configured on the server yet.');
+  }
+
+  const params = new URLSearchParams({
+    client_id: process.env.EBAY_APP_ID,
+    redirect_uri: process.env.EBAY_RUNAME,
+    response_type: 'code',
+    scope: EBAY_SCOPES
+  });
+
+  res.redirect(`${EBAY_AUTH_BASE}/oauth2/authorize?${params.toString()}`);
+});
+
+// Step 2: eBay redirects here with a code - exchange it for tokens automatically
+app.get('/api/ebay/oauth/callback', async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) {
+      return res.redirect('https://stocktracker-app.com/?ebay=error');
+    }
+
+    const response = await fetch(`${EBAY_API_BASE}/identity/v1/oauth2/token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': getEbayBasicAuthHeader()
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        redirect_uri: process.env.EBAY_RUNAME
+      })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('eBay token exchange failed:', data);
+      return res.redirect('https://stocktracker-app.com/?ebay=error');
+    }
+
+    const expiresAt = new Date(Date.now() + data.expires_in * 1000).toISOString();
+
+    const updates = {
+      ebay_access_token: data.access_token,
+      ebay_refresh_token: data.refresh_token,
+      ebay_token_expires_at: expiresAt,
+      ebay_connected_at: new Date().toISOString(),
+      ebay_active: 'true'
+    };
+
+    for (const [key, value] of Object.entries(updates)) {
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = $2`,
+        [key, value]
+      );
+    }
+
+    res.redirect('https://stocktracker-app.com/?ebay=connected');
+  } catch (err) {
+    console.error('eBay OAuth callback error:', err);
+    res.redirect('https://stocktracker-app.com/?ebay=error');
+  }
+});
+
+app.get('/api/ebay/oauth/declined', (req, res) => {
+  res.redirect('https://stocktracker-app.com/?ebay=declined');
+});
+
+// Automatically refreshes the access token using the refresh token if it's expired or close to it
+async function getValidEbayAccessToken() {
+  const settingsResult = await pool.query(
+    `SELECT key, value FROM app_settings WHERE key IN ('ebay_access_token', 'ebay_refresh_token', 'ebay_token_expires_at')`
+  );
+  const settings = {};
+  settingsResult.rows.forEach(row => { settings[row.key] = row.value; });
+
+  if (!settings.ebay_refresh_token) {
+    throw new Error('eBay is not connected yet');
+  }
+
+  const expiresAt = settings.ebay_token_expires_at ? new Date(settings.ebay_token_expires_at) : new Date(0);
+  const stillValid = expiresAt.getTime() - Date.now() > 5 * 60 * 1000; // 5 min buffer
+
+  if (stillValid) {
+    return settings.ebay_access_token;
+  }
+
+  // Refresh it
+  const response = await fetch(`${EBAY_API_BASE}/identity/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': getEbayBasicAuthHeader()
+    },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: settings.ebay_refresh_token,
+      scope: EBAY_SCOPES
+    })
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error('Failed to refresh eBay token: ' + JSON.stringify(data));
+  }
+
+  const newExpiresAt = new Date(Date.now() + data.expires_in * 1000).toISOString();
+  await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ('ebay_access_token', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [data.access_token]
+  );
+  await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ('ebay_token_expires_at', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [newExpiresAt]
+  );
+
+  return data.access_token;
+}
+
+// Real connection status for the Settings page - not a manual toggle
+app.get('/api/ebay/status', async (req, res) => {
+  try {
+    const settingsResult = await pool.query(
+      `SELECT key, value FROM app_settings WHERE key IN ('ebay_connected_at', 'ebay_refresh_token', 'ebay_token_expires_at')`
+    );
+    const settings = {};
+    settingsResult.rows.forEach(row => { settings[row.key] = row.value; });
+
+    if (!settings.ebay_refresh_token) {
+      return res.json({ connected: false });
+    }
+
+    // Confirm the connection is actually still good by trying to get a valid token
+    try {
+      await getValidEbayAccessToken();
+      res.json({
+        connected: true,
+        connectedAt: settings.ebay_connected_at
+      });
+    } catch (err) {
+      res.json({ connected: false, reason: 'Token refresh failed - may need to reconnect' });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to check eBay status' });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
 });
