@@ -140,17 +140,18 @@ app.get('/api/archive', async (req, res) => {
 // Dashboard summary stats
 app.get('/api/stats', async (req, res) => {
   try {
-    const totalResult = await pool.query('SELECT COUNT(*) FROM items');
+    const totalResult = await pool.query("SELECT COUNT(*) FROM items WHERE item_type = 'stock'");
 
     const sellingResult = await pool.query(
       `SELECT COUNT(*), COALESCE(SUM(listing_price), 0) as total_listing_value 
-       FROM items WHERE status IN ('ACTIVE', 'LISTED')`
+       FROM items WHERE status IN ('ACTIVE', 'LISTED') AND item_type = 'stock'`
     );
 
     const attentionResult = await pool.query(
       `SELECT COUNT(*) FROM items 
        WHERE status NOT IN ('SOLD', 'DISPATCHED', 'ARCHIVED') 
-       AND created_at < NOW() - INTERVAL '90 days'`
+       AND created_at < NOW() - INTERVAL '90 days'
+       AND item_type = 'stock'`
     );
 
     res.json({
@@ -177,7 +178,8 @@ app.get('/api/items', async (req, res) => {
       `SELECT id FROM items 
        WHERE status = 'DISPATCHED' 
        AND date_dispatched < NOW() - ($1 * INTERVAL '1 day')
-       AND return_requested IS NOT TRUE`,
+       AND return_requested IS NOT TRUE
+       AND item_type = 'stock'`,
       [archiveAfterDays]
     );
 
@@ -240,6 +242,8 @@ app.get('/api/items', async (req, res) => {
       }
     }
 
+    const requestedType = req.query.type === 'personal' ? 'personal' : 'stock';
+
     const itemsResult = await pool.query(
       `SELECT *,
         EXTRACT(DAY FROM NOW() - created_at)::int AS days_held,
@@ -251,7 +255,9 @@ app.get('/api/items', async (req, res) => {
              ELSE NULL END AS days_since_dispatch,
         (status NOT IN ('SOLD', 'DISPATCHED', 'ARCHIVED') AND created_at < NOW() - INTERVAL '90 days') AS needs_attention
        FROM items 
-       ORDER BY created_at DESC`
+       WHERE item_type = $1
+       ORDER BY created_at DESC`,
+      [requestedType]
     );
 
     const imagesResult = await pool.query(
@@ -343,6 +349,7 @@ app.post('/api/items', async (req, res) => {
       box_number,
       box_id,
       quantity,
+      item_type,
       ebay_estimated_low,
       ebay_estimated_high,
       ebay_estimated_median,
@@ -352,6 +359,7 @@ app.post('/api/items', async (req, res) => {
     const qty = Math.max(1, parseInt(quantity, 10) || 1);
     const createdItems = [];
     const hasPriceEstimate = ebay_estimated_median !== undefined && ebay_estimated_median !== null;
+    const resolvedItemType = item_type === 'personal' ? 'personal' : 'stock';
 
     for (let i = 0; i < qty; i++) {
       const numResult = await pool.query("SELECT nextval('item_number_seq') AS n");
@@ -360,11 +368,11 @@ app.post('/api/items', async (req, res) => {
       const result = await pool.query(
         `INSERT INTO items 
           (item_number, brand, category, size, colour, condition, material, style, department, outer_shell_material, purchase_cost, listing_price, status, box_number, box_id,
-           ebay_estimated_low, ebay_estimated_high, ebay_estimated_median, ebay_estimated_count, ebay_price_checked_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+           ebay_estimated_low, ebay_estimated_high, ebay_estimated_median, ebay_estimated_count, ebay_price_checked_at, item_type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
          RETURNING *`,
         [itemNumber, brand, category, size, colour || null, condition, material || null, style || null, department || null, outer_shell_material || null, purchase_cost || null, listing_price || null, status || 'DRAFT', box_number || null, box_id || null,
-         ebay_estimated_low || null, ebay_estimated_high || null, ebay_estimated_median || null, ebay_estimated_count || null, hasPriceEstimate ? new Date().toISOString() : null]
+         ebay_estimated_low || null, ebay_estimated_high || null, ebay_estimated_median || null, ebay_estimated_count || null, hasPriceEstimate ? new Date().toISOString() : null, resolvedItemType]
       );
 
       createdItems.push({ ...result.rows[0], generated_description: generateDescription(result.rows[0]) });
@@ -1044,15 +1052,42 @@ app.get('/api/expenses', async (req, res) => {
   }
 });
 
+// List personally-funded expenses not yet paid back, so each can be settled individually
+app.get('/api/expenses/unreimbursed', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM expenses WHERE paid_from != 'Revolut Pro' AND reimbursed IS NOT TRUE ORDER BY expense_date DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch unreimbursed expenses' });
+  }
+});
+
+app.patch('/api/expenses/:id/reimburse', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE expenses SET reimbursed = TRUE WHERE id = $1 RETURNING *`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to mark expense as reimbursed' });
+  }
+});
+
 app.post('/api/expenses', uploadReceipt.single('receipt'), async (req, res) => {
   try {
-    const { expense_date, category, description, amount, notes } = req.body;
+    const { expense_date, category, description, amount, notes, paid_from } = req.body;
     const receiptKey = req.file ? `uploads/receipts/${req.file.filename}` : null;
 
     const result = await pool.query(
-      `INSERT INTO expenses (expense_date, category, description, amount, receipt_key, notes)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [expense_date, category, description, amount, receiptKey, notes || null]
+      `INSERT INTO expenses (expense_date, category, description, amount, receipt_key, notes, paid_from)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [expense_date, category, description, amount, receiptKey, notes || null, paid_from || 'Revolut Pro']
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -1090,7 +1125,7 @@ app.get('/api/bookkeeping/summary', async (req, res) => {
     // Turnover: items actually sold within this tax year
     const turnoverResult = await pool.query(
       `SELECT COALESCE(SUM(sold_price), 0) AS total, COALESCE(SUM(selling_fees), 0) AS fees FROM items
-       WHERE status IN ('SOLD', 'DISPATCHED', 'ARCHIVED') AND date_sold >= $1 AND date_sold <= $2`,
+       WHERE status IN ('SOLD', 'DISPATCHED', 'ARCHIVED') AND date_sold >= $1 AND date_sold <= $2 AND item_type = 'stock'`,
       [start, end]
     );
     const turnover = parseFloat(turnoverResult.rows[0].total);
@@ -1159,6 +1194,15 @@ app.get('/api/bookkeeping/summary', async (req, res) => {
     const returnsCount = parseInt(returnsResult.rows[0].count, 10);
     const returnsValue = parseFloat(returnsResult.rows[0].total);
 
+    // Running balance of business expenses you personally funded and haven't paid
+    // yourself back for yet - all-time, not tied to a tax year, since it's just
+    // tracking an ongoing personal reimbursement balance.
+    const owedResult = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM expenses
+       WHERE paid_from != 'Revolut Pro' AND reimbursed IS NOT TRUE`
+    );
+    const owedToYou = parseFloat(owedResult.rows[0].total);
+
     res.json({
       taxYear: { startYear, label: `${startYear}/${String(startYear + 1).slice(2)}` },
       turnover,
@@ -1176,6 +1220,7 @@ app.get('/api/bookkeeping/summary', async (req, res) => {
       receiptsRecorded: stockReceipts + mileageReceipts + expenseReceipts,
       returnsCount,
       returnsValue,
+      owedToYou,
       deadlines: {
         registration: deadlines.registrationDeadline,
         filingAndPayment: deadlines.filingPaymentDeadline
@@ -1206,7 +1251,7 @@ app.get('/api/bookkeeping/export', async (req, res) => {
     csv += 'Item Number,Date Sold,Brand,Category,Purchase Cost,Has Purchase Receipt,Sold Price,Marketplace Fees,Net Profit\n';
     const salesResult = await pool.query(
       `SELECT item_number, date_sold, brand, category, purchase_cost, purchase_receipt_key, sold_price, selling_fees FROM items
-       WHERE status IN ('SOLD', 'DISPATCHED', 'ARCHIVED') AND date_sold >= $1 AND date_sold <= $2
+       WHERE status IN ('SOLD', 'DISPATCHED', 'ARCHIVED') AND date_sold >= $1 AND date_sold <= $2 AND item_type = 'stock'
        ORDER BY date_sold ASC`,
       [start, end]
     );
@@ -1244,7 +1289,7 @@ app.get('/api/bookkeeping/export', async (req, res) => {
     }
 
     csv += '\nEXPENSES\n';
-    csv += 'Date,Category,Description,Amount,Notes,Has Receipt\n';
+    csv += 'Date,Category,Description,Amount,Paid From,Notes,Has Receipt\n';
     const expensesResult = await pool.query(
       `SELECT * FROM expenses WHERE expense_date >= $1 AND expense_date <= $2 ORDER BY expense_date ASC`,
       [start, end]
@@ -1255,6 +1300,7 @@ app.get('/api/bookkeeping/export', async (req, res) => {
         csvEscape(row.category),
         csvEscape(row.description),
         parseFloat(row.amount).toFixed(2),
+        csvEscape(row.paid_from || 'Revolut Pro'),
         csvEscape(row.notes),
         row.receipt_key ? 'Yes' : 'No'
       ].join(',') + '\n';
