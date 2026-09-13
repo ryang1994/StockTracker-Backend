@@ -342,11 +342,16 @@ app.post('/api/items', async (req, res) => {
       status,
       box_number,
       box_id,
-      quantity
+      quantity,
+      ebay_estimated_low,
+      ebay_estimated_high,
+      ebay_estimated_median,
+      ebay_estimated_count
     } = req.body;
 
     const qty = Math.max(1, parseInt(quantity, 10) || 1);
     const createdItems = [];
+    const hasPriceEstimate = ebay_estimated_median !== undefined && ebay_estimated_median !== null;
 
     for (let i = 0; i < qty; i++) {
       const numResult = await pool.query("SELECT nextval('item_number_seq') AS n");
@@ -354,10 +359,12 @@ app.post('/api/items', async (req, res) => {
 
       const result = await pool.query(
         `INSERT INTO items 
-          (item_number, brand, category, size, colour, condition, material, style, department, outer_shell_material, purchase_cost, listing_price, status, box_number, box_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+          (item_number, brand, category, size, colour, condition, material, style, department, outer_shell_material, purchase_cost, listing_price, status, box_number, box_id,
+           ebay_estimated_low, ebay_estimated_high, ebay_estimated_median, ebay_estimated_count, ebay_price_checked_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
          RETURNING *`,
-        [itemNumber, brand, category, size, colour || null, condition, material || null, style || null, department || null, outer_shell_material || null, purchase_cost || null, listing_price || null, status || 'DRAFT', box_number || null, box_id || null]
+        [itemNumber, brand, category, size, colour || null, condition, material || null, style || null, department || null, outer_shell_material || null, purchase_cost || null, listing_price || null, status || 'DRAFT', box_number || null, box_id || null,
+         ebay_estimated_low || null, ebay_estimated_high || null, ebay_estimated_median || null, ebay_estimated_count || null, hasPriceEstimate ? new Date().toISOString() : null]
       );
 
       createdItems.push({ ...result.rows[0], generated_description: generateDescription(result.rows[0]) });
@@ -1549,6 +1556,235 @@ async function getValidEbayAccessToken() {
 }
 
 // Real connection status for the Settings page - not a manual toggle
+// ===================== EBAY PRICE RESEARCH (Browse API, Application token) =====================
+
+// Mints/reuses an Application access token via client credentials grant - always against
+// Production, since Sandbox has no real listings to search against.
+async function getEbayApplicationToken() {
+  const settingsResult = await pool.query(
+    `SELECT key, value FROM app_settings WHERE key IN ('ebay_app_token', 'ebay_app_token_expires_at')`
+  );
+  const settings = {};
+  settingsResult.rows.forEach(row => { settings[row.key] = row.value; });
+
+  const expiresAt = settings.ebay_app_token_expires_at ? new Date(settings.ebay_app_token_expires_at) : new Date(0);
+  const stillValid = expiresAt.getTime() - Date.now() > 5 * 60 * 1000;
+
+  if (stillValid && settings.ebay_app_token) {
+    return settings.ebay_app_token;
+  }
+
+  const credentials = `${process.env.EBAY_PROD_APP_ID}:${process.env.EBAY_PROD_CERT_ID}`;
+  const basicAuth = 'Basic ' + Buffer.from(credentials).toString('base64');
+
+  const response = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': basicAuth
+    },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      scope: 'https://api.ebay.com/oauth/api_scope'
+    })
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error('Failed to get eBay application token: ' + JSON.stringify(data));
+  }
+
+  const newExpiresAt = new Date(Date.now() + data.expires_in * 1000).toISOString();
+  await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ('ebay_app_token', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [data.access_token]
+  );
+  await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ('ebay_app_token_expires_at', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [newExpiresAt]
+  );
+
+  return data.access_token;
+}
+
+// Real-time search against live eBay UK listings - read-only, no user account involved
+app.get('/api/ebay/price-check', async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q || !q.trim()) {
+      return res.status(400).json({ error: 'A search query is required' });
+    }
+
+    const token = await getEbayApplicationToken();
+
+    const params = new URLSearchParams({
+      q: q.trim(),
+      limit: '30',
+      filter: 'buyingOptions:{FIXED_PRICE}'
+    });
+
+    const response = await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?${params.toString()}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_GB'
+      }
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('eBay Browse API error:', data);
+      return res.status(502).json({ error: 'eBay search failed', details: data });
+    }
+
+    const items = data.itemSummaries || [];
+    const prices = items
+      .map(item => parseFloat(item.price && item.price.value))
+      .filter(p => !isNaN(p))
+      .sort((a, b) => a - b);
+
+    let median = null;
+    if (prices.length > 0) {
+      const mid = Math.floor(prices.length / 2);
+      median = prices.length % 2 !== 0 ? prices[mid] : (prices[mid - 1] + prices[mid]) / 2;
+    }
+
+    res.json({
+      query: q.trim(),
+      totalActive: data.total || 0,
+      sampledCount: prices.length,
+      lowPrice: prices.length > 0 ? prices[0] : null,
+      highPrice: prices.length > 0 ? prices[prices.length - 1] : null,
+      medianPrice: median,
+      sampleItems: items.slice(0, 5).map(item => ({
+        title: item.title,
+        price: item.price ? item.price.value : null,
+        condition: item.condition
+      }))
+    });
+  } catch (err) {
+    console.error('Price check error:', err);
+    res.status(500).json({ error: 'Failed to check eBay prices', details: err.message });
+  }
+});
+
+// Manual marketplace-active toggles. Vinted stays manual permanently (no accessible API).
+// eBay's toggle is a placeholder until real listing creation exists - once it does,
+// this becomes a genuine API-checked status instead of a manual click.
+app.patch('/api/items/:id/marketplace-status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { active_on_ebay, active_on_vinted } = req.body;
+
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    if (active_on_ebay !== undefined) {
+      fields.push(`active_on_ebay = $${idx++}`);
+      values.push(active_on_ebay);
+    }
+    if (active_on_vinted !== undefined) {
+      fields.push(`active_on_vinted = $${idx++}`);
+      values.push(active_on_vinted);
+    }
+
+    if (fields.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE items SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $${idx} RETURNING *`,
+      values
+    );
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+
+    res.json({ ...result.rows[0], generated_description: generateDescription(result.rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update marketplace status', details: err.message });
+  }
+});
+
+// Refresh an existing item's eBay price estimate, saving the result
+app.post('/api/items/:id/price-check', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const itemResult = await pool.query('SELECT * FROM items WHERE id = $1', [id]);
+    if (itemResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+    const item = itemResult.rows[0];
+
+    const cleanedSize = (item.size || '').replace(/\([^)]*\)/g, '').trim();
+    const parts = [item.brand, item.department, item.category, cleanedSize];
+    let query = parts.filter(p => p && p.trim()).join(' ').trim();
+
+    if (!query) {
+      return res.status(400).json({ error: 'Not enough item details to search with' });
+    }
+
+    const token = await getEbayApplicationToken();
+
+    const runSearch = async (searchQuery) => {
+      const params = new URLSearchParams({
+        q: searchQuery,
+        limit: '30',
+        filter: 'buyingOptions:{FIXED_PRICE}'
+      });
+      const response = await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?${params.toString()}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_GB'
+        }
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error('eBay search failed: ' + JSON.stringify(data));
+      return data;
+    };
+
+    let data = await runSearch(query);
+
+    if (!data.total) {
+      const broaderQuery = [item.brand, item.category].filter(p => p && p.trim()).join(' ').trim();
+      if (broaderQuery && broaderQuery !== query) {
+        const broaderData = await runSearch(broaderQuery);
+        if (broaderData.total > 0) {
+          data = broaderData;
+          query = broaderQuery;
+        }
+      }
+    }
+
+    const items = data.itemSummaries || [];
+    const prices = items
+      .map(i => parseFloat(i.price && i.price.value))
+      .filter(p => !isNaN(p))
+      .sort((a, b) => a - b);
+
+    let median = null, low = null, high = null;
+    if (prices.length > 0) {
+      const mid = Math.floor(prices.length / 2);
+      median = prices.length % 2 !== 0 ? prices[mid] : (prices[mid - 1] + prices[mid]) / 2;
+      low = prices[0];
+      high = prices[prices.length - 1];
+    }
+
+    const updateResult = await pool.query(
+      `UPDATE items SET ebay_estimated_low = $1, ebay_estimated_high = $2, ebay_estimated_median = $3, ebay_estimated_count = $4, ebay_price_checked_at = NOW()
+       WHERE id = $5 RETURNING *`,
+      [low, high, median, data.total || 0, id]
+    );
+
+    res.json({ ...updateResult.rows[0], generated_description: generateDescription(updateResult.rows[0]) });
+  } catch (err) {
+    console.error('Item price check error:', err);
+    res.status(500).json({ error: 'Failed to check eBay prices', details: err.message });
+  }
+});
+
 app.get('/api/ebay/status', async (req, res) => {
   try {
     const settingsResult = await pool.query(
