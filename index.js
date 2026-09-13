@@ -1608,6 +1608,441 @@ async function getEbayApplicationToken() {
 }
 
 // Real-time search against live eBay UK listings - read-only, no user account involved
+// ===================== EBAY CATEGORY MAPPING (Taxonomy API) =====================
+// Uses the same Application token as price research - no new auth needed.
+
+async function getEbayCategoryTreeId() {
+  const cached = await pool.query("SELECT value FROM app_settings WHERE key = 'ebay_category_tree_id'");
+  if (cached.rows.length > 0) return cached.rows[0].value;
+
+  const token = await getEbayApplicationToken();
+  const response = await fetch('https://api.ebay.com/commerce/taxonomy/v1/get_default_category_tree_id?marketplace_id=EBAY_GB', {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error('Failed to get category tree id: ' + JSON.stringify(data));
+
+  await pool.query(
+    `INSERT INTO app_settings (key, value) VALUES ('ebay_category_tree_id', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [data.categoryTreeId]
+  );
+  return data.categoryTreeId;
+}
+
+// Suggests real eBay categories based on a text search - e.g. brand + category
+app.get('/api/ebay/category-suggestions', async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q || !q.trim()) {
+      return res.status(400).json({ error: 'A search query is required' });
+    }
+
+    const token = await getEbayApplicationToken();
+    const treeId = await getEbayCategoryTreeId();
+
+    const params = new URLSearchParams({ q: q.trim() });
+    const response = await fetch(`https://api.ebay.com/commerce/taxonomy/v1/category_tree/${treeId}/get_category_suggestions?${params.toString()}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('Category suggestions failed:', data);
+      return res.status(502).json({ error: 'Failed to get category suggestions', details: data });
+    }
+
+    const suggestions = (data.categorySuggestions || []).map(s => ({
+      categoryId: s.category.categoryId,
+      categoryName: s.category.categoryName,
+      path: (s.categoryTreeNodeAncestors || []).map(a => a.categoryName).reverse().join(' > ')
+    }));
+
+    res.json({ suggestions });
+  } catch (err) {
+    console.error('Category suggestion error:', err);
+    res.status(500).json({ error: 'Failed to get category suggestions', details: err.message });
+  }
+});
+
+// Real, eBay-defined required/recommended fields for a specific category
+app.get('/api/ebay/item-aspects', async (req, res) => {
+  try {
+    const { category_id } = req.query;
+    if (!category_id) {
+      return res.status(400).json({ error: 'category_id is required' });
+    }
+
+    const token = await getEbayApplicationToken();
+    const treeId = await getEbayCategoryTreeId();
+
+    const response = await fetch(`https://api.ebay.com/commerce/taxonomy/v1/category_tree/${treeId}/get_item_aspects_for_category?category_id=${category_id}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('Item aspects failed:', data);
+      return res.status(502).json({ error: 'Failed to get item aspects', details: data });
+    }
+
+    const aspects = (data.aspects || []).map(a => ({
+      name: a.localizedAspectName,
+      required: a.aspectConstraint && a.aspectConstraint.aspectRequired,
+      mode: a.aspectConstraint && a.aspectConstraint.aspectMode,
+      values: (a.aspectValues || []).map(v => v.localizedValue).slice(0, 20)
+    }));
+
+    res.json({ aspects });
+  } catch (err) {
+    console.error('Item aspects error:', err);
+    res.status(500).json({ error: 'Failed to get item aspects', details: err.message });
+  }
+});
+
+// Save the chosen eBay category onto an item
+// Save confirmed eBay aspect selections (e.g. Colour: "Blue" picked from eBay's controlled list)
+app.patch('/api/items/:id/aspects', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { aspects } = req.body;
+
+    const result = await pool.query(
+      `UPDATE items SET ebay_aspects = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [JSON.stringify(aspects || {}), id]
+    );
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    res.json({ ...result.rows[0], generated_description: generateDescription(result.rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save aspects', details: err.message });
+  }
+});
+
+// Same best-guess logic as the frontend, so the publish payload matches what's actually displayed
+function guessValueForAspectServer(aspectName, item) {
+  const name = aspectName.toLowerCase();
+  if (name.includes('brand')) return item.brand;
+  if (name.includes('colour') || name.includes('color')) return item.colour;
+  if (name.includes('department')) return item.department;
+  if (name.includes('size')) return item.size;
+  if (name.includes('style')) return item.style;
+  if (name.includes('type')) return item.category;
+  if (name.includes('outer shell') || name.includes('material')) return item.outer_shell_material || item.material;
+  if (name.includes('condition')) return item.condition;
+  return '';
+}
+
+function findClosestValueServer(guess, values) {
+  if (!guess || !values || values.length === 0) return '';
+  const guessLower = guess.toLowerCase();
+  const exact = values.find(v => v.toLowerCase() === guessLower);
+  if (exact) return exact;
+  const partial = values.find(v => guessLower.includes(v.toLowerCase()) || v.toLowerCase().includes(guessLower));
+  if (partial) return partial;
+  return '';
+}
+
+const EBAY_CONDITION_MAP = {
+  'Like New': 'LIKE_NEW',
+  'Very Good': 'USED_VERY_GOOD',
+  'Good': 'USED_GOOD',
+  'Fair': 'USED_ACCEPTABLE'
+};
+
+// Standard eBay Condition ID -> ConditionEnum mapping, ranked roughly best-to-worst
+const CONDITION_ID_TO_ENUM = [
+  { id: 2750, enumValue: 'LIKE_NEW' },
+  { id: 4000, enumValue: 'USED_VERY_GOOD' },
+  { id: 5000, enumValue: 'USED_GOOD' },
+  { id: 6000, enumValue: 'USED_ACCEPTABLE' },
+  { id: 3000, enumValue: 'USED_EXCELLENT' },
+  { id: 1000, enumValue: 'NEW' }
+];
+
+// Different eBay categories support different condition sets - check what's actually
+// valid here rather than assume our fixed mapping always works, falling back to the
+// closest available option if our preferred one isn't supported for this category.
+async function getValidConditionForCategory(categoryId, preferredEnum) {
+  const token = await getEbayApplicationToken();
+  const url = `https://api.ebay.com/sell/metadata/v1/marketplace/EBAY_GB/get_item_condition_policies?filter=categoryIds:{${categoryId}}`;
+  const response = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  const data = await response.json();
+
+  console.log('Condition policy check URL:', url);
+  console.log('Condition policy check response:', response.status, JSON.stringify(data));
+
+  if (!response.ok || !data.itemConditionPolicies || data.itemConditionPolicies.length === 0) {
+    console.log('Condition policy check inconclusive - keeping preferred value:', preferredEnum);
+    return preferredEnum;
+  }
+
+  const validIds = (data.itemConditionPolicies[0].itemConditions || []).map(c => parseInt(c.conditionId, 10));
+  console.log('Valid condition IDs for category', categoryId, ':', validIds);
+
+  const preferredMatch = CONDITION_ID_TO_ENUM.find(c => c.enumValue === preferredEnum);
+
+  if (preferredMatch && validIds.includes(preferredMatch.id)) {
+    return preferredEnum;
+  }
+
+  const closest = CONDITION_ID_TO_ENUM.find(c => validIds.includes(c.id));
+  console.log('Preferred condition not valid, falling back to:', closest ? closest.enumValue : preferredEnum);
+  return closest ? closest.enumValue : preferredEnum;
+}
+
+// The actual publish sequence: createOrReplaceInventoryItem -> createOffer -> publishOffer
+// Simple verification tool - visit this URL directly in a browser to see the real,
+// current status of an item's eBay listing straight from eBay's API, bypassing
+// eBay's own Sandbox dashboard entirely (which is known to be unreliable).
+app.get('/api/items/:id/ebay-status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const itemResult = await pool.query('SELECT * FROM items WHERE id = $1', [id]);
+    if (itemResult.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    const item = itemResult.rows[0];
+
+    if (!item.ebay_offer_id) {
+      return res.json({ hasOffer: false, message: 'This item has no eBay offer on record yet.' });
+    }
+
+    const token = await getValidEbayAccessToken();
+    const response = await fetch(`${EBAY_API_BASE}/sell/inventory/v1/offer/${item.ebay_offer_id}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Language': 'en-GB',
+        'Accept-Language': 'en-GB'
+      }
+    });
+    const data = await response.json();
+
+    if (!response.ok) {
+      return res.status(502).json({ error: 'Could not fetch offer status from eBay', details: data });
+    }
+
+    res.json({
+      hasOffer: true,
+      itemNumber: item.item_number,
+      offerId: item.ebay_offer_id,
+      storedListingId: item.ebay_listing_id,
+      ebayStatus: data.status,
+      ebayListing: data.listing,
+      fullResponse: data
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to check eBay status', details: err.message });
+  }
+});
+
+app.post('/api/items/:id/publish-ebay', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const itemResult = await pool.query('SELECT * FROM items WHERE id = $1', [id]);
+    if (itemResult.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    const item = itemResult.rows[0];
+
+    const imagesResult = await pool.query('SELECT * FROM images WHERE item_id = $1 AND is_deleted = FALSE ORDER BY created_at ASC', [id]);
+    const images = imagesResult.rows;
+
+    // --- Pre-flight checks ---
+    if (!item.ebay_category_id) {
+      return res.status(400).json({ error: 'This item needs an eBay category selected first.' });
+    }
+    if (images.length === 0) {
+      return res.status(400).json({ error: 'This item needs at least one photo.' });
+    }
+    if (!item.listing_price) {
+      return res.status(400).json({ error: 'This item needs a listing price.' });
+    }
+
+    const settingsResult = await pool.query(
+      `SELECT key, value FROM app_settings WHERE key IN ('ebay_fulfillment_policy_id', 'ebay_return_policy_id', 'ebay_payment_policy_id', 'ebay_merchant_location_key')`
+    );
+    const settings = {};
+    settingsResult.rows.forEach(row => { settings[row.key] = row.value; });
+
+    if (!settings.ebay_fulfillment_policy_id || !settings.ebay_return_policy_id || !settings.ebay_payment_policy_id) {
+      return res.status(400).json({ error: 'Business Policies need to be set up in Settings before publishing.' });
+    }
+    if (!settings.ebay_merchant_location_key) {
+      return res.status(400).json({ error: 'An inventory location needs to be set up in Settings before publishing.' });
+    }
+
+    const preferredCondition = EBAY_CONDITION_MAP[item.condition];
+    if (!preferredCondition) {
+      return res.status(400).json({ error: `Condition "${item.condition}" isn't set, or isn't one eBay recognizes (Like New, Very Good, Good, Fair).` });
+    }
+
+    let mappedCondition;
+    try {
+      mappedCondition = await getValidConditionForCategory(item.ebay_category_id, preferredCondition);
+    } catch (err) {
+      console.error('Condition policy check failed, using preferred mapping:', err.message);
+      mappedCondition = preferredCondition;
+    }
+
+    // --- Fetch fresh required aspects and compute effective values (same logic as the card display) ---
+    const token = await getEbayApplicationToken();
+    const treeId = await getEbayCategoryTreeId();
+    const aspectsResponse = await fetch(`https://api.ebay.com/commerce/taxonomy/v1/category_tree/${treeId}/get_item_aspects_for_category?category_id=${item.ebay_category_id}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const aspectsData = await aspectsResponse.json();
+    if (!aspectsResponse.ok) {
+      return res.status(502).json({ error: 'Could not verify required fields with eBay', details: aspectsData });
+    }
+
+    const aspects = (aspectsData.aspects || []).map(a => ({
+      name: a.localizedAspectName,
+      required: a.aspectConstraint && a.aspectConstraint.aspectRequired,
+      mode: a.aspectConstraint && a.aspectConstraint.aspectMode,
+      values: (a.aspectValues || []).map(v => v.localizedValue)
+    }));
+
+    const savedAspects = item.ebay_aspects || {};
+    const effectiveAspects = {};
+    const missingRequired = [];
+
+    for (const a of aspects) {
+      const saved = savedAspects[a.name];
+      const guess = guessValueForAspectServer(a.name, item);
+      const hasControlledValues = a.mode === 'SELECTION_ONLY' && a.values.length > 0;
+      const effective = saved || (hasControlledValues ? findClosestValueServer(guess, a.values) : guess);
+
+      if (effective) {
+        effectiveAspects[a.name] = [effective];
+      } else if (a.required) {
+        missingRequired.push(a.name);
+      }
+    }
+
+    if (missingRequired.length > 0) {
+      return res.status(400).json({ error: `Missing required eBay fields: ${missingRequired.join(', ')}` });
+    }
+
+    // --- Build the payloads ---
+    const sku = item.item_number;
+    const imageUrls = images.map(img => `https://stocktracker-app.com/${img.object_key}`);
+    const title = [item.department, item.brand, item.colour, item.style, item.category]
+      .filter(Boolean).join(' ').slice(0, 80) || `${item.brand || ''} ${item.category || ''}`.trim().slice(0, 80);
+
+    const userToken = await getValidEbayAccessToken();
+    const headers = {
+      'Authorization': `Bearer ${userToken}`,
+      'Content-Type': 'application/json',
+      'Content-Language': 'en-GB',
+      'Accept-Language': 'en-GB'
+    };
+
+    // Step 1: createOrReplaceInventoryItem
+    const inventoryPayload = {
+      availability: { shipToLocationAvailability: { quantity: 1 } },
+      condition: mappedCondition,
+      product: {
+        title,
+        description: item.generated_description || title,
+        imageUrls,
+        aspects: effectiveAspects
+      }
+    };
+
+    const inventoryRes = await fetch(`${EBAY_API_BASE}/sell/inventory/v1/inventory_item/${sku}`, {
+      method: 'PUT', headers, body: JSON.stringify(inventoryPayload)
+    });
+
+    if (inventoryRes.status !== 200 && inventoryRes.status !== 201 && inventoryRes.status !== 204) {
+      const data = await inventoryRes.json().catch(() => ({}));
+      console.error('createOrReplaceInventoryItem failed:', JSON.stringify(data));
+      return res.status(502).json({ error: 'Failed at step 1 (inventory item)', details: data, step: 'inventory_item' });
+    }
+
+    // Step 2: createOffer - but first check if one already exists for this SKU
+    // (e.g. from a previous attempt that got this far before failing at publish)
+    let offerId;
+    const existingOfferRes = await fetch(`${EBAY_API_BASE}/sell/inventory/v1/offer?sku=${sku}&marketplace_id=EBAY_GB`, { headers });
+    const existingOfferData = await existingOfferRes.json().catch(() => ({}));
+
+    if (existingOfferRes.ok && existingOfferData.offers && existingOfferData.offers.length > 0) {
+      offerId = existingOfferData.offers[0].offerId;
+    } else {
+      const offerPayload = {
+        sku,
+        marketplaceId: 'EBAY_GB',
+        format: 'FIXED_PRICE',
+        availableQuantity: 1,
+        categoryId: item.ebay_category_id,
+        listingDescription: item.generated_description || title,
+        listingPolicies: {
+          fulfillmentPolicyId: settings.ebay_fulfillment_policy_id,
+          paymentPolicyId: settings.ebay_payment_policy_id,
+          returnPolicyId: settings.ebay_return_policy_id
+        },
+        pricingSummary: {
+          price: { value: parseFloat(item.listing_price).toFixed(2), currency: 'GBP' }
+        },
+        merchantLocationKey: settings.ebay_merchant_location_key
+      };
+
+      const offerRes = await fetch(`${EBAY_API_BASE}/sell/inventory/v1/offer`, {
+        method: 'POST', headers, body: JSON.stringify(offerPayload)
+      });
+      const offerData = await offerRes.json();
+
+      if (!offerRes.ok) {
+        console.error('createOffer failed:', JSON.stringify(offerData));
+        return res.status(502).json({ error: 'Failed at step 2 (offer)', details: offerData, step: 'offer' });
+      }
+
+      offerId = offerData.offerId;
+    }
+
+    // Step 3: publishOffer
+    const publishRes = await fetch(`${EBAY_API_BASE}/sell/inventory/v1/offer/${offerId}/publish`, {
+      method: 'POST', headers
+    });
+    const publishData = await publishRes.json();
+
+    if (!publishRes.ok) {
+      console.error('publishOffer failed:', JSON.stringify(publishData));
+      return res.status(502).json({ error: 'Failed at step 3 (publish)', details: publishData, step: 'publish' });
+    }
+
+    // Success - save the real listing ID, a clickable link to it, and flip the status
+    const ebayListingUrl = `https://www.${EBAY_ENV === 'production' ? '' : 'sandbox.'}ebay.com/itm/${publishData.listingId}`;
+    const updateResult = await pool.query(
+      `UPDATE items SET ebay_listing_id = $1, ebay_offer_id = $2, ebay_url = $3, active_on_ebay = TRUE, status = 'ACTIVE', updated_at = NOW() WHERE id = $4 RETURNING *`,
+      [publishData.listingId, offerId, ebayListingUrl, id]
+    );
+
+    res.json({ success: true, listingId: publishData.listingId, item: { ...updateResult.rows[0], generated_description: generateDescription(updateResult.rows[0]) } });
+  } catch (err) {
+    console.error('Publish to eBay error:', err);
+    res.status(500).json({ error: 'Failed to publish to eBay', details: err.message });
+  }
+});
+
+app.patch('/api/items/:id/category', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { ebay_category_id, ebay_category_name } = req.body;
+
+    const result = await pool.query(
+      `UPDATE items SET ebay_category_id = $1, ebay_category_name = $2, updated_at = NOW() WHERE id = $3 RETURNING *`,
+      [ebay_category_id, ebay_category_name, id]
+    );
+
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    res.json({ ...result.rows[0], generated_description: generateDescription(result.rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save category', details: err.message });
+  }
+});
+
 app.get('/api/ebay/price-check', async (req, res) => {
   try {
     const { q } = req.query;
@@ -1708,6 +2143,66 @@ app.patch('/api/items/:id/marketplace-status', async (req, res) => {
   }
 });
 
+// ===================== EBAY INVENTORY LOCATION =====================
+// A second one-time prerequisite before any offer can be published - "where this ships from".
+
+app.get('/api/ebay/inventory-location/status', async (req, res) => {
+  try {
+    const result = await pool.query("SELECT value FROM app_settings WHERE key = 'ebay_merchant_location_key'");
+    res.json({ configured: result.rows.length > 0, merchantLocationKey: result.rows.length > 0 ? result.rows[0].value : null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to check inventory location status' });
+  }
+});
+
+app.post('/api/ebay/inventory-location/create', async (req, res) => {
+  try {
+    const { postalCode } = req.body;
+    if (!postalCode || !postalCode.trim()) {
+      return res.status(400).json({ error: 'A postal code is required' });
+    }
+
+    const token = await getValidEbayAccessToken();
+    const merchantLocationKey = 'stocktracker-location-1';
+
+    const response = await fetch(`${EBAY_API_BASE}/sell/inventory/v1/location/${merchantLocationKey}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        location: {
+          address: {
+            postalCode: postalCode.trim(),
+            country: 'GB'
+          }
+        },
+        name: 'StockTracker Warehouse',
+        merchantLocationStatus: 'ENABLED',
+        locationTypes: ['WAREHOUSE']
+      })
+    });
+
+    if (response.status !== 204 && !response.ok) {
+      const data = await response.json().catch(() => ({}));
+      console.error('Inventory location creation failed:', JSON.stringify(data));
+      return res.status(502).json({ error: 'Failed to create inventory location', details: data });
+    }
+
+    await pool.query(
+      `INSERT INTO app_settings (key, value) VALUES ('ebay_merchant_location_key', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
+      [merchantLocationKey]
+    );
+
+    res.json({ success: true, merchantLocationKey });
+  } catch (err) {
+    console.error('Inventory location error:', err);
+    res.status(500).json({ error: 'Failed to create inventory location', details: err.message });
+  }
+});
+
 // Refresh an existing item's eBay price estimate, saving the result
 app.post('/api/items/:id/price-check', async (req, res) => {
   try {
@@ -1782,6 +2277,151 @@ app.post('/api/items/:id/price-check', async (req, res) => {
   } catch (err) {
     console.error('Item price check error:', err);
     res.status(500).json({ error: 'Failed to check eBay prices', details: err.message });
+  }
+});
+
+// ===================== EBAY BUSINESS POLICIES =====================
+// Required one-time setup before any real listing can be published.
+
+app.get('/api/ebay/business-policies/status', async (req, res) => {
+  try {
+    const token = await getValidEbayAccessToken();
+    const response = await fetch(`${EBAY_API_BASE}/sell/account/v1/program/get_opted_in_programs`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      return res.status(502).json({ error: 'Failed to check opt-in status', details: data });
+    }
+    const programs = (data.programs || []).map(p => p.programType);
+    res.json({ optedIn: programs.includes('SELLING_POLICY_MANAGEMENT'), programs });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to check business policies status', details: err.message });
+  }
+});
+
+app.post('/api/ebay/business-policies/opt-in', async (req, res) => {
+  try {
+    const token = await getValidEbayAccessToken();
+    const response = await fetch(`${EBAY_API_BASE}/sell/account/v1/program/opt_in`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ programType: 'SELLING_POLICY_MANAGEMENT' })
+    });
+
+    if (response.status === 204 || response.ok) {
+      return res.json({ success: true });
+    }
+
+    const data = await response.json().catch(() => ({}));
+    console.error('eBay opt-in failed:', data);
+    res.status(502).json({ error: 'eBay opt-in failed - this can be a known Sandbox glitch, try again in a moment', details: data });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to opt in to business policies', details: err.message });
+  }
+});
+
+app.post('/api/ebay/business-policies/create', async (req, res) => {
+  try {
+    const { flatShippingCost } = req.body;
+    const shippingCost = parseFloat(flatShippingCost) || 3.99;
+    const token = await getValidEbayAccessToken();
+
+    const headers = {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'Accept-Language': 'en-GB'
+    };
+
+    // Fulfillment (shipping) policy - 3 day handling, buyer pays flat rate
+    const fulfillmentPayload = {
+      name: 'StockTracker Standard Shipping',
+      marketplaceId: 'EBAY_GB',
+      categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+      handlingTime: { value: 3, unit: 'DAY' },
+      shippingOptions: [
+        {
+          optionType: 'DOMESTIC',
+          costType: 'FLAT_RATE',
+          shippingServices: [
+            {
+              sortOrder: 1,
+              shippingCarrierCode: 'Royal Mail',
+              shippingServiceCode: 'UK_RoyalMailSecondClassStandard',
+              shippingCost: { value: shippingCost.toFixed(2), currency: 'GBP' },
+              freeShipping: false
+            }
+          ]
+        }
+      ]
+    };
+
+    const fulfillmentRes = await fetch(`${EBAY_API_BASE}/sell/account/v1/fulfillment_policy`, {
+      method: 'POST', headers, body: JSON.stringify(fulfillmentPayload)
+    });
+    const fulfillmentData = await fulfillmentRes.json();
+    if (!fulfillmentRes.ok) {
+      console.error('Fulfillment policy failed:', JSON.stringify(fulfillmentData));
+      return res.status(502).json({ error: 'Failed to create fulfillment policy', details: fulfillmentData, step: 'fulfillment' });
+    }
+
+    // Return policy - 14 days, buyer pays return shipping
+    const returnPayload = {
+      name: 'StockTracker Standard Returns',
+      marketplaceId: 'EBAY_GB',
+      categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }],
+      returnsAccepted: true,
+      returnPeriod: { value: 14, unit: 'DAY' },
+      refundMethod: 'MONEY_BACK',
+      returnShippingCostPayer: 'BUYER'
+    };
+
+    const returnRes = await fetch(`${EBAY_API_BASE}/sell/account/v1/return_policy`, {
+      method: 'POST', headers, body: JSON.stringify(returnPayload)
+    });
+    const returnData = await returnRes.json();
+    if (!returnRes.ok) {
+      console.error('Return policy failed:', JSON.stringify(returnData));
+      return res.status(502).json({ error: 'Failed to create return policy', details: returnData, step: 'return' });
+    }
+
+    // Payment policy - eBay handles payment processing itself on managed-payments marketplaces like the UK
+    const paymentPayload = {
+      name: 'StockTracker Standard Payment',
+      marketplaceId: 'EBAY_GB',
+      categoryTypes: [{ name: 'ALL_EXCLUDING_MOTORS_VEHICLES' }]
+    };
+
+    const paymentRes = await fetch(`${EBAY_API_BASE}/sell/account/v1/payment_policy`, {
+      method: 'POST', headers, body: JSON.stringify(paymentPayload)
+    });
+    const paymentData = await paymentRes.json();
+    if (!paymentRes.ok) {
+      console.error('Payment policy failed:', JSON.stringify(paymentData));
+      return res.status(502).json({ error: 'Failed to create payment policy', details: paymentData, step: 'payment' });
+    }
+
+    const updates = {
+      ebay_fulfillment_policy_id: fulfillmentData.fulfillmentPolicyId,
+      ebay_return_policy_id: returnData.returnPolicyId,
+      ebay_payment_policy_id: paymentData.paymentPolicyId
+    };
+    for (const [key, value] of Object.entries(updates)) {
+      await pool.query(
+        `INSERT INTO app_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2`,
+        [key, value]
+      );
+    }
+
+    res.json({ success: true, ...updates });
+  } catch (err) {
+    console.error('Business policy creation error:', err);
+    res.status(500).json({ error: 'Failed to create business policies', details: err.message });
   }
 });
 
